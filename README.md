@@ -34,7 +34,8 @@ python wfc.py input.png output.png --colors 6 --drop-bonds 30 --error-allowance 
 
 ## How it works
 
-1. **Preprocess** – resize to fit 200 px, quantize to `--colors` (median cut, no dithering).
+1. **Preprocess** – resize to fit 200 px with nearest-neighbor (sharp, MS Paint style; change with
+   `--resample`), then quantize to `--colors` (median cut, no dithering).
 2. **Patterns** – collect every `N×N` window (wrapping at the edges), dedupe, keep the
    `--max-patterns` most frequent.
 3. **Bonds** – two patterns may be neighbors if their overlap matches.
@@ -55,6 +56,7 @@ python wfc.py input.png output.png --colors 6 --drop-bonds 30 --error-allowance 
 | `--in-size` | 200 | Longest side of the preprocessed source |
 | `--out-size` | 300 | Output width and height |
 | `--colors` | 8 | Palette size after quantization |
+| `--resample` | nearest | Shrink method: `nearest` (sharp), `box`, `bilinear`, `lanczos` (these average and soften) |
 | `--n` | 2 | Pattern size (`N×N`). Larger means more structure, slower, more contradictions |
 | `--max-patterns` | 800 | Keep only the most frequent patterns |
 | `--drop-bonds PCT` | 0 | Per pattern and direction, discard the lowest PCT % of bonds (0–99) |

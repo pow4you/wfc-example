@@ -163,9 +163,17 @@ def run(comp, weights, H, W, seed, max_errors):
                 return wave, True, errors
 
 
-def load_quantized(path, size, colors):
+RESAMPLE = {
+    "nearest": Image.NEAREST,
+    "box": Image.BOX,
+    "bilinear": Image.BILINEAR,
+    "lanczos": Image.LANCZOS,
+}
+
+
+def load_quantized(path, size, colors, resample="nearest"):
     im = Image.open(path).convert("RGB")
-    im.thumbnail((size, size), Image.LANCZOS)
+    im.thumbnail((size, size), RESAMPLE[resample])
     q = im.quantize(colors=colors, method=Image.MEDIANCUT, dither=Image.NONE)
     pal = np.array(q.getpalette()[: colors * 3], dtype=np.uint8).reshape(-1, 3)
     return np.array(q, dtype=np.uint8), pal
@@ -224,6 +232,9 @@ def main():
     ap.add_argument("--in-size", type=int, default=200)
     ap.add_argument("--out-size", type=int, default=300)
     ap.add_argument("--colors", type=int, default=8)
+    ap.add_argument("--resample", choices=list(RESAMPLE), default="nearest",
+                    help="how the source is shrunk: nearest keeps hard pixels (MS Paint style), "
+                         "the others average and blur edges (default nearest)")
     ap.add_argument("--n", type=int, default=2)
     ap.add_argument("--max-patterns", type=int, default=800)
     ap.add_argument("--seed", type=int, default=None)
@@ -239,7 +250,7 @@ def main():
                          "try is abandoned (default 0.02)")
     a = ap.parse_args()
 
-    idx, pal = load_quantized(a.src, a.in_size, a.colors)
+    idx, pal = load_quantized(a.src, a.in_size, a.colors, a.resample)
     print(f"quantized {idx.shape[1]}x{idx.shape[0]}, {len(pal)} colors")
     if a.preprocess_only:
         Image.fromarray(pal[idx]).save(a.dst)
