@@ -50,7 +50,7 @@ def build_compat(pats, n):
 
 
 @nb.njit(cache=True)
-def run(comp, weights, H, W, seed):
+def run(comp, weights, H, W, seed, max_errors):
     np.random.seed(seed)
     P = weights.shape[0]
     Wd = comp.shape[2]
@@ -63,6 +63,8 @@ def run(comp, weights, H, W, seed):
     stack = np.empty(N * 4, dtype=np.int64)
     in_stack = np.zeros(N, dtype=np.bool_)
     allowed = np.zeros(Wd, dtype=np.uint64)
+    tmp = np.zeros(Wd, dtype=np.uint64)
+    errors = 0
 
     # heap of (entropy-ish key, cell); lazy invalidation
     heap = [(0.0, 0)]
@@ -120,13 +122,18 @@ def run(comp, weights, H, W, seed):
                 newc = 0
                 for wi in range(Wd):
                     nw = wave[m, wi] & allowed[wi]
+                    tmp[wi] = nw
                     if nw != wave[m, wi]:
                         changed = True
-                        wave[m, wi] = nw
                     newc += popcount(nw)
                 if changed:
                     if newc == 0:
-                        return wave, False
+                        # contradiction: tolerate it by ignoring this constraint
+                        errors += 1
+                        if errors > max_errors:
+                            return wave, False, errors
+                        continue
+                    wave[m, :] = tmp
                     counts[m] = newc
                     if not in_stack[m]:
                         stack[sp] = m
@@ -138,7 +145,7 @@ def run(comp, weights, H, W, seed):
                     elif newc > 1:
                         heapq.heappush(heap, (newc + np.random.random() * 0.1, m))
         if n_done >= N:
-            return wave, True
+            return wave, True, errors
 
         # --- next cell: lowest entropy, lazily validated ---
         cell = -1
@@ -153,7 +160,7 @@ def run(comp, weights, H, W, seed):
                     cell = m
                     break
             if cell == -1:
-                return wave, True
+                return wave, True, errors
 
 
 def load_quantized(path, size, colors):
@@ -223,9 +230,13 @@ def main():
     ap.add_argument("--tries", type=int, default=50)
     ap.add_argument("--preprocess-only", action="store_true",
                     help="only save the resized + quantized image to dst, then exit")
-    ap.add_argument("--min-bond", type=float, default=0.0,
-                    help="discard bonds (neighbour pairs) whose observed probability in the "
-                         "source is below this, e.g. 0.02. 0 = keep every overlap-compatible bond")
+    ap.add_argument("--drop-bonds", type=float, default=0.0, metavar="PCT",
+                    help="per pattern and direction, rank its neighbour bonds by observed "
+                         "probability and throw out the lowest PCT percent (0-99). Every "
+                         "pattern keeps at least its best bond in each direction")
+    ap.add_argument("--error-allowance", type=float, default=0.02, metavar="FRAC",
+                    help="fraction of output cells allowed to violate a constraint before a "
+                         "try is abandoned (default 0.02)")
     a = ap.parse_args()
 
     idx, pal = load_quantized(a.src, a.in_size, a.colors)
@@ -239,13 +250,22 @@ def main():
     P = len(pats)
     comp = build_compat(pats, a.n)
     mask = unpack(comp, P)
-    if a.min_bond > 0:
+    if a.drop_bonds > 0:
         probs = observed_bond_probs(grid, P)
+        rng0 = np.random.default_rng(a.seed)
         before = mask.sum()
+        kept = np.zeros_like(mask)
         for d in range(4):
-            # a bond must be likely from both sides (a->b in d, b->a in opposite)
-            mask[d] &= (probs[d] >= a.min_bond) & (probs[OPP[d]].T >= a.min_bond)
-        print(f"bonds: {before} -> {mask.sum()} (min-bond {a.min_bond})")
+            score = np.where(mask[d], probs[d] + rng0.random((P, P)) * 1e-9, -1.0)
+            order = np.argsort(-score, axis=1)
+            ranks = np.empty_like(order)
+            np.put_along_axis(ranks, order, np.broadcast_to(np.arange(P), (P, P)), axis=1)
+            n_a = mask[d].sum(axis=1)
+            k = np.maximum(1, np.ceil(n_a * (1 - a.drop_bonds / 100)).astype(np.int64))
+            kept[d] = mask[d] & (ranks < k[:, None])
+        for d in range(4):  # keep a bond if either side wants it (stays symmetric)
+            mask[d] = kept[d] | kept[OPP[d]].T
+        print(f"bonds: {before} -> {mask.sum()} (dropped lowest {a.drop_bonds}% per pattern)")
     while True:  # drop patterns with no neighbour in some direction (dead ends)
         keep = np.ones(len(pats), dtype=bool)
         for d in range(4):
@@ -263,8 +283,8 @@ def main():
     S = a.out_size
     for t in range(a.tries):
         s = int(rng.integers(0, 2**31 - 1))
-        wave, ok = run(comp, wts, S, S, s)
-        print(f"try {t}: seed={s} {'ok' if ok else 'contradiction'}")
+        wave, ok, errs = run(comp, wts, S, S, s, int(a.error_allowance * S * S))
+        print(f"try {t}: seed={s} {'ok' if ok else 'too many errors'} ({errs} violations)")
         if ok:
             break
     P = len(pats)
