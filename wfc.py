@@ -156,21 +156,58 @@ def run(comp, weights, H, W, seed):
                 return wave, True
 
 
-def prepare(path, size, colors, n, max_patterns):
+def load_quantized(path, size, colors):
     im = Image.open(path).convert("RGB")
     im.thumbnail((size, size), Image.LANCZOS)
     q = im.quantize(colors=colors, method=Image.MEDIANCUT, dither=Image.NONE)
     pal = np.array(q.getpalette()[: colors * 3], dtype=np.uint8).reshape(-1, 3)
-    idx = np.array(q, dtype=np.uint8)
+    return np.array(q, dtype=np.uint8), pal
+
+
+def extract_patterns(idx, n, max_patterns):
     h, w = idx.shape
-    # all NxN windows (with wraparound so edges contribute)
-    padded = np.pad(idx, ((0, n - 1), (0, n - 1)), mode="wrap")
+    padded = np.pad(idx, ((0, n - 1), (0, n - 1)), mode="wrap")  # edges count too
     wins = np.stack(
         [padded[y : y + h, x : x + w] for y in range(n) for x in range(n)], axis=-1
     ).reshape(-1, n * n)
-    pats, counts = np.unique(wins, axis=0, return_counts=True)
+    pats, inv, counts = np.unique(wins, axis=0, return_inverse=True, return_counts=True)
     order = np.argsort(-counts)[:max_patterns]
-    return pats[order].reshape(-1, n, n).astype(np.uint8), counts[order].astype(np.float64), pal, q.size
+    remap = np.full(len(pats), -1, dtype=np.int64)
+    remap[order] = np.arange(len(order))
+    grid = remap[inv.reshape(-1)].reshape(h, w)  # pattern id per source pixel (-1 = dropped)
+    return pats[order].reshape(-1, n, n).astype(np.uint8), counts[order].astype(np.float64), grid
+
+
+def observed_bond_probs(grid, P):
+    """prob[d][a, b] = P(b is neighbour of a in direction d | a), from the source image."""
+    h, w = grid.shape
+    probs = np.zeros((4, P, P))
+    for d in range(4):
+        dx, dy = DIRS[d]
+        ya, yb = (slice(0, h - dy), slice(dy, h)) if dy >= 0 else (slice(-dy, h), slice(0, h + dy))
+        xa, xb = (slice(0, w - dx), slice(dx, w)) if dx >= 0 else (slice(-dx, w), slice(0, w + dx))
+        a, b = grid[ya, xa].ravel(), grid[yb, xb].ravel()
+        ok = (a >= 0) & (b >= 0)
+        cnt = np.bincount(a[ok] * P + b[ok], minlength=P * P).reshape(P, P).astype(np.float64)
+        probs[d] = cnt / np.maximum(cnt.sum(axis=1, keepdims=True), 1)
+    return probs
+
+
+def unpack(comp, P):
+    return np.stack(
+        [np.unpackbits(comp[d].view(np.uint8), axis=1, bitorder="little")[:, :P].astype(bool) for d in range(4)]
+    )
+
+
+def pack(mask):
+    P = mask.shape[1]
+    Wd = (P + 63) // 64
+    out = np.zeros((4, mask.shape[1], Wd), dtype=np.uint64)
+    for d in range(4):
+        padded = np.zeros((P, Wd * 64), dtype=bool)
+        padded[:, :P] = mask[d]
+        out[d] = np.packbits(padded, axis=1, bitorder="little").view(np.uint64)
+    return out
 
 
 def main():
@@ -184,22 +221,44 @@ def main():
     ap.add_argument("--max-patterns", type=int, default=800)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--tries", type=int, default=50)
+    ap.add_argument("--preprocess-only", action="store_true",
+                    help="only save the resized + quantized image to dst, then exit")
+    ap.add_argument("--min-bond", type=float, default=0.0,
+                    help="discard bonds (neighbour pairs) whose observed probability in the "
+                         "source is below this, e.g. 0.02. 0 = keep every overlap-compatible bond")
     a = ap.parse_args()
 
-    pats, wts, pal, qsize = prepare(a.src, a.in_size, a.colors, a.n, a.max_patterns)
-    print(f"quantized {qsize}, {len(pal)} colors, {len(pats)} patterns")
+    idx, pal = load_quantized(a.src, a.in_size, a.colors)
+    print(f"quantized {idx.shape[1]}x{idx.shape[0]}, {len(pal)} colors")
+    if a.preprocess_only:
+        Image.fromarray(pal[idx]).save(a.dst)
+        print("saved", a.dst)
+        return
+
+    pats, wts, grid = extract_patterns(idx, a.n, a.max_patterns)
+    P = len(pats)
     comp = build_compat(pats, a.n)
-    while True:  # drop dead-end patterns so truncation can't cause contradictions
-        P = len(pats)
-        keep = np.ones(P, dtype=bool)
+    mask = unpack(comp, P)
+    if a.min_bond > 0:
+        probs = observed_bond_probs(grid, P)
+        before = mask.sum()
         for d in range(4):
-            bits = np.unpackbits(comp[d].view(np.uint8), axis=1, bitorder="little")[:, :P]
-            keep &= bits.any(axis=1)
+            # a bond must be likely from both sides (a->b in d, b->a in opposite)
+            mask[d] &= (probs[d] >= a.min_bond) & (probs[OPP[d]].T >= a.min_bond)
+        print(f"bonds: {before} -> {mask.sum()} (min-bond {a.min_bond})")
+    while True:  # drop patterns with no neighbour in some direction (dead ends)
+        keep = np.ones(len(pats), dtype=bool)
+        for d in range(4):
+            keep &= mask[d].any(axis=1) & mask[OPP[d]].any(axis=1)
         if keep.all():
             break
         pats, wts = pats[keep], wts[keep]
-        comp = build_compat(pats, a.n)
-    print(f"{len(pats)} patterns after pruning")
+        mask = mask[:, keep][:, :, keep]
+    if len(pats) == 0:
+        raise SystemExit("no patterns left: lower --min-bond or --n")
+    print(f"{len(pats)} patterns")
+    comp = pack(mask)
+
     rng = np.random.default_rng(a.seed)
     S = a.out_size
     for t in range(a.tries):
@@ -208,7 +267,6 @@ def main():
         print(f"try {t}: seed={s} {'ok' if ok else 'contradiction'}")
         if ok:
             break
-    # each cell holds exactly one pattern (or, on failure, take the first bit)
     P = len(pats)
     out = np.zeros(S * S, dtype=np.uint8)
     for i in range(S * S):
